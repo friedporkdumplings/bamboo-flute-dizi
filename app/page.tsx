@@ -23,15 +23,18 @@ import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointer
 import type { HandLandmarker, NormalizedLandmark } from "@mediapipe/tasks-vision";
 import { fingeringMap, type Fingering, type NoteKey, type NoteRegister } from "@/lib/fingeringMap";
 import {
-  addRestingFingerPose,
-  buildCoveredFingerMap,
+  addRestingFingerPoseForHand,
+  buildCoveredFingerMapForHand,
   detectHoleCoverage,
   detectMappedCoverage,
   HAND_CONNECTIONS,
   smoothCoverage,
   type CoveredFingerBinding,
+  type FingerBinding,
+  type HandAnchor,
   type HandCalibration,
 } from "@/lib/handTracking";
+import { captureHandAnchor, trackFluteLayout, type FluteGeometry } from "@/lib/fluteTracking";
 import { parseNumberedNotes } from "@/lib/noteParser";
 import SheetViewer from "@/app/components/SheetViewer";
 
@@ -74,7 +77,8 @@ const OPEN_FINGERING: Fingering = [false, false, false, false, false, false];
 
 type CameraStatus = "idle" | "requesting" | "live" | "denied" | "error";
 type TrackingStatus = "idle" | "loading" | "running" | "no-hands" | "error";
-type HandSetupPhase = "idle" | "covered" | "resting";
+type HandSetupPhase = "idle" | "left-covered" | "right-covered" | "left-resting" | "right-resting";
+type FluteEndpoint = "start" | "end";
 
 type HolePosition = {
   id: number;
@@ -87,6 +91,19 @@ const DEFAULT_HOLE_POSITIONS: HolePosition[] = Array.from({ length: 6 }, (_, ind
   x: 0.3 + index * 0.08,
   y: 0.52,
 }));
+
+const DEFAULT_FLUTE_GEOMETRY: FluteGeometry = {
+  startX: 0.12,
+  startY: 0.52,
+  endX: 0.88,
+  endY: 0.52,
+  thickness: 0.16,
+};
+
+type FluteCalibration = {
+  holes: HolePosition[];
+  geometry: FluteGeometry;
+};
 
 const CALIBRATION_STORAGE_KEY = "bamboo-flute-calibration-v1";
 const HAND_CALIBRATION_STORAGE_KEY = "bamboo-hand-calibration-v1";
@@ -102,10 +119,29 @@ function clamp(value: number, min = 0.04, max = 0.96) {
   return Math.min(max, Math.max(min, value));
 }
 
+function fluteStyle(geometry: FluteGeometry) {
+  const dx = geometry.endX - geometry.startX;
+  const dy = geometry.endY - geometry.startY;
+  return {
+    left: `${((geometry.startX + geometry.endX) / 2) * 100}%`,
+    top: `${((geometry.startY + geometry.endY) / 2) * 100}%`,
+    width: `${Math.hypot(dx, dy) * 100}%`,
+    height: `${geometry.thickness * 100}%`,
+    transform: `translate(-50%, -50%) rotate(${Math.atan2(dy, dx)}rad)`,
+  };
+}
+
 function isHandCalibration(value: unknown): value is HandCalibration {
   if (!value || typeof value !== "object" || !("bindings" in value)) return false;
   const bindings = (value as { bindings?: unknown }).bindings;
-  return Array.isArray(bindings)
+  const anchors = (value as { anchors?: unknown }).anchors;
+  return Array.isArray(anchors)
+    && anchors.length === 2
+    && anchors.every((anchor) => anchor && typeof anchor === "object"
+      && typeof (anchor as HandAnchor).handLabel === "string"
+      && Number.isFinite((anchor as HandAnchor).x)
+      && Number.isFinite((anchor as HandAnchor).y))
+    && Array.isArray(bindings)
     && bindings.length === 6
     && bindings.every((binding) => {
       if (!binding || typeof binding !== "object") return false;
@@ -230,7 +266,11 @@ export default function Home() {
   const [calibrating, setCalibrating] = useState(false);
   const [hasCalibration, setHasCalibration] = useState(false);
   const [holePositions, setHolePositions] = useState<HolePosition[]>(DEFAULT_HOLE_POSITIONS);
+  const [trackedHolePositions, setTrackedHolePositions] = useState<HolePosition[]>(DEFAULT_HOLE_POSITIONS);
   const [draggingHole, setDraggingHole] = useState<number | null>(null);
+  const [fluteGeometry, setFluteGeometry] = useState<FluteGeometry>(DEFAULT_FLUTE_GEOMETRY);
+  const [trackedFluteGeometry, setTrackedFluteGeometry] = useState<FluteGeometry>(DEFAULT_FLUTE_GEOMETRY);
+  const [draggingFluteEndpoint, setDraggingFluteEndpoint] = useState<FluteEndpoint | null>(null);
   const [trackingStatus, setTrackingStatus] = useState<TrackingStatus>("idle");
   const [detectedHoles, setDetectedHoles] = useState<Fingering>([false, false, false, false, false, false]);
   const [debugMode, setDebugMode] = useState(true);
@@ -251,9 +291,14 @@ export default function Home() {
   const lastVideoTimeRef = useRef(-1);
   const coverageHistoryRef = useRef<boolean[][]>([]);
   const holePositionsRef = useRef<HolePosition[]>(DEFAULT_HOLE_POSITIONS);
+  const fluteGeometryRef = useRef<FluteGeometry>(DEFAULT_FLUTE_GEOMETRY);
+  const trackedHolePositionsRef = useRef<HolePosition[]>(DEFAULT_HOLE_POSITIONS);
+  const lastLayoutUpdateRef = useRef(0);
   const debugModeRef = useRef(true);
   const handCalibrationRef = useRef<HandCalibration | null>(null);
   const coveredFingerMapRef = useRef<CoveredFingerBinding[] | null>(null);
+  const restingFingerMapRef = useRef<FingerBinding[]>([]);
+  const handAnchorsRef = useRef<HandAnchor[]>([]);
   const latestHandFrameRef = useRef<LatestHandFrame | null>(null);
 
   const note = song[currentIndex];
@@ -267,8 +312,10 @@ export default function Home() {
       : DEMO_DETECTED[currentIndex % DEMO_DETECTED.length];
   const feedback = useMemo(() => getFeedback(target, detected), [target, detected]);
   const feedbackState = (() => {
-    if (handSetupPhase === "covered") return { correct: false, label: "HAND SETUP · 1 OF 2", text: "Cover all six holes, then capture", hole: null };
-    if (handSetupPhase === "resting") return { correct: false, label: "HAND SETUP · 2 OF 2", text: "Lift the six playing fingers slightly, then capture", hole: null };
+    if (handSetupPhase === "left-covered") return { correct: false, label: "HAND SETUP · 1 OF 4", text: "Cover holes 1–3 with your left hand", hole: null };
+    if (handSetupPhase === "right-covered") return { correct: false, label: "HAND SETUP · 2 OF 4", text: "Cover holes 4–6 with your right hand", hole: null };
+    if (handSetupPhase === "left-resting") return { correct: false, label: "HAND SETUP · 3 OF 4", text: "Raise your left playing fingers slightly", hole: null };
+    if (handSetupPhase === "right-resting") return { correct: false, label: "HAND SETUP · 4 OF 4", text: "Raise your right playing fingers slightly", hole: null };
     if (cameraStatus === "live" && hasCalibration && !handCalibration) return { correct: false, label: "HAND MAP REQUIRED", text: "Map your playing and resting finger positions", hole: null };
     if (trackingStatus === "loading") return { correct: false, label: "PREPARING TRACKER", text: "Loading the hand model…", hole: null };
     if (trackingStatus === "no-hands") return { correct: false, label: "NO HANDS DETECTED", text: "Move both hands into the camera view", hole: null };
@@ -277,9 +324,11 @@ export default function Home() {
   })();
 
   const trackerHint = (() => {
-    if (calibrating) return "Drag each marker onto a flute hole";
-    if (handSetupPhase === "covered") return "Cover all six holes with your normal grip";
-    if (handSetupPhase === "resting") return "Lift the six playing fingers slightly";
+    if (calibrating) return "Adjust the flute ends, thickness, and six hole markers";
+    if (handSetupPhase === "left-covered") return "Left hand covers holes 1–3 · right hand presses capture";
+    if (handSetupPhase === "right-covered") return "Right hand covers holes 4–6 · left hand presses capture";
+    if (handSetupPhase === "left-resting") return "Lift the left playing fingers slightly";
+    if (handSetupPhase === "right-resting") return "Lift the right playing fingers slightly";
     if (hasCalibration && !handCalibration) return "Map your fingers before starting practice";
     if (trackingStatus === "loading") return "Loading hand tracking…";
     if (trackingStatus === "no-hands") return "Move both hands into the frame";
@@ -314,12 +363,22 @@ export default function Home() {
     const saved = window.localStorage.getItem(CALIBRATION_STORAGE_KEY);
     if (saved) {
       try {
-        const parsed = JSON.parse(saved) as HolePosition[];
-        if (parsed.length === 6 && parsed.every((hole) => Number.isFinite(hole.x) && Number.isFinite(hole.y))) {
+        const parsed = JSON.parse(saved) as FluteCalibration | HolePosition[];
+        const savedHoles = Array.isArray(parsed) ? parsed : parsed.holes;
+        const savedGeometry = Array.isArray(parsed) ? DEFAULT_FLUTE_GEOMETRY : parsed.geometry;
+        if (savedHoles.length === 6
+          && savedHoles.every((hole) => Number.isFinite(hole.x) && Number.isFinite(hole.y))
+          && savedGeometry
+          && [savedGeometry.startX, savedGeometry.startY, savedGeometry.endX, savedGeometry.endY, savedGeometry.thickness].every(Number.isFinite)) {
           // Restore the browser-owned calibration after hydration.
           // eslint-disable-next-line react-hooks/set-state-in-effect
-          setHolePositions(parsed);
-          holePositionsRef.current = parsed;
+          setHolePositions(savedHoles);
+          setTrackedHolePositions(savedHoles);
+          setFluteGeometry(savedGeometry);
+          setTrackedFluteGeometry(savedGeometry);
+          holePositionsRef.current = savedHoles;
+          trackedHolePositionsRef.current = savedHoles;
+          fluteGeometryRef.current = savedGeometry;
           setHasCalibration(true);
         }
       } catch {
@@ -426,14 +485,34 @@ export default function Home() {
                 width: liveCanvas.clientWidth,
                 height: liveCanvas.clientHeight,
               };
-              const frame = handCalibrationRef.current
+              const calibration = handCalibrationRef.current;
+              const trackedLayout = calibration
+                ? trackFluteLayout(
+                    holePositionsRef.current,
+                    fluteGeometryRef.current,
+                    calibration.anchors,
+                    result.landmarks,
+                    handLabels,
+                  )
+                : null;
+              const activeHoles = trackedLayout?.holes ?? holePositionsRef.current;
+              if (trackedLayout) {
+                trackedHolePositionsRef.current = trackedLayout.holes;
+                if (performance.now() - lastLayoutUpdateRef.current > 80) {
+                  lastLayoutUpdateRef.current = performance.now();
+                  setTrackedHolePositions(trackedLayout.holes);
+                  setTrackedFluteGeometry(trackedLayout.geometry);
+                }
+              }
+              const frame = calibration
                 ? detectMappedCoverage(
                     result.landmarks,
                     handLabels,
-                    holePositionsRef.current,
-                    handCalibrationRef.current,
+                    activeHoles,
+                    calibration,
                     liveCanvas.clientWidth,
                     liveCanvas.clientHeight,
+                    trackedLayout?.scale ?? 1,
                   )
                 : detectHoleCoverage(
                     result.landmarks,
@@ -486,7 +565,7 @@ export default function Home() {
       if (!hasCalibration) {
         setCalibrating(true);
       } else {
-        if (!handCalibrationRef.current) setHandSetupPhase("covered");
+        if (!handCalibrationRef.current) setHandSetupPhase("left-covered");
         void initializeHandTracking();
       }
     } catch (error) {
@@ -520,6 +599,23 @@ export default function Home() {
     });
   };
 
+  const updateFluteEndpoint = (event: ReactPointerEvent<HTMLElement>) => {
+    if (!draggingFluteEndpoint || !calibrating) return;
+    const stage = event.currentTarget.closest(".camera-stage");
+    if (!stage) return;
+    const rect = stage.getBoundingClientRect();
+    const x = clamp((event.clientX - rect.left) / rect.width);
+    const y = clamp((event.clientY - rect.top) / rect.height);
+    setFluteGeometry((geometry) => {
+      const nextGeometry = draggingFluteEndpoint === "start"
+        ? { ...geometry, startX: x, startY: y }
+        : { ...geometry, endX: x, endY: y };
+      fluteGeometryRef.current = nextGeometry;
+      setTrackedFluteGeometry(nextGeometry);
+      return nextGeometry;
+    });
+  };
+
   const beginCalibration = () => {
     stopTracking(false);
     setHandSetupPhase("idle");
@@ -528,15 +624,22 @@ export default function Home() {
   };
 
   const confirmCalibration = () => {
-    window.localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(holePositions));
+    const calibration: FluteCalibration = { holes: holePositions, geometry: fluteGeometry };
+    window.localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(calibration));
     setHasCalibration(true);
     setCalibrating(false);
     setDraggingHole(null);
+    setDraggingFluteEndpoint(null);
+    setTrackedHolePositions(holePositions);
+    trackedHolePositionsRef.current = holePositions;
+    setTrackedFluteGeometry(fluteGeometry);
     window.localStorage.removeItem(HAND_CALIBRATION_STORAGE_KEY);
     setHandCalibration(null);
     handCalibrationRef.current = null;
     coveredFingerMapRef.current = null;
-    setHandSetupPhase("covered");
+    restingFingerMapRef.current = [];
+    handAnchorsRef.current = [];
+    setHandSetupPhase("left-covered");
     setHandSetupError("");
     void initializeHandTracking();
   };
@@ -544,76 +647,126 @@ export default function Home() {
   const cancelCalibration = () => {
     setCalibrating(false);
     setDraggingHole(null);
-    if (!handCalibrationRef.current) setHandSetupPhase("covered");
+    setDraggingFluteEndpoint(null);
+    if (!handCalibrationRef.current) setHandSetupPhase("left-covered");
     void initializeHandTracking();
   };
 
   const beginHandCalibration = () => {
     if (cameraStatus !== "live" || !hasCalibration) return;
     coveredFingerMapRef.current = null;
+    restingFingerMapRef.current = [];
+    handAnchorsRef.current = [];
+    handCalibrationRef.current = null;
     setHandSetupError("");
-    setHandSetupPhase("covered");
+    setHandSetupPhase("left-covered");
     if (trackingStatus === "idle" || trackingStatus === "error") void initializeHandTracking();
   };
 
-  const captureCoveredPose = () => {
+  const captureHandPose = () => {
     const frame = latestHandFrameRef.current;
-    if (!frame || frame.hands.length < 2) {
-      setHandSetupError("Keep both hands fully visible, then try again.");
+    if (!frame || frame.hands.length === 0 || handSetupPhase === "idle") {
+      setHandSetupError("Keep the requested hand fully visible, then try again.");
       return;
     }
-    const bindings = buildCoveredFingerMap(
-      frame.hands,
-      frame.handLabels,
-      holePositionsRef.current,
-      frame.width,
-      frame.height,
-    );
-    if (!bindings) {
-      setHandSetupError("I could not match all six playing fingers. Center both hands over the markers.");
-      return;
-    }
-    coveredFingerMapRef.current = bindings;
-    setHandSetupError("");
-    setHandSetupPhase("resting");
-  };
+    const requestedHand = handSetupPhase.startsWith("left") ? "left" : "right";
+    const requestedHoles = holePositionsRef.current.filter((hole) => (
+      requestedHand === "left" ? hole.id <= 3 : hole.id >= 4
+    ));
 
-  const captureRestingPose = () => {
-    const frame = latestHandFrameRef.current;
-    const coveredBindings = coveredFingerMapRef.current;
-    if (!frame || frame.hands.length < 2 || !coveredBindings) {
-      setHandSetupError("Keep both hands visible and repeat the covered pose first.");
-      setHandSetupPhase("covered");
+    if (handSetupPhase.endsWith("covered")) {
+      const bindings = buildCoveredFingerMapForHand(
+        frame.hands,
+        frame.handLabels,
+        requestedHand,
+        requestedHoles,
+        frame.width,
+        frame.height,
+      );
+      const anchor = captureHandAnchor(frame.hands, frame.handLabels, requestedHand);
+      if (!bindings || !anchor) {
+        setHandSetupError(`I could not map the ${requestedHand} hand. Align its three playing fingers with the highlighted holes.`);
+        return;
+      }
+      coveredFingerMapRef.current = [...(coveredFingerMapRef.current ?? []), ...bindings];
+      handAnchorsRef.current = [...handAnchorsRef.current.filter((item) => item.handLabel !== anchor.handLabel), anchor];
+      setHandSetupError("");
+      setHandSetupPhase(requestedHand === "left" ? "right-covered" : "left-resting");
       return;
     }
-    const calibration = addRestingFingerPose(
+
+    const coveredBindings = (coveredFingerMapRef.current ?? []).filter((binding) => (
+      requestedHand === "left" ? binding.holeId <= 3 : binding.holeId >= 4
+    ));
+    const restingBindings = addRestingFingerPoseForHand(
       coveredBindings,
       frame.hands,
       frame.handLabels,
-      holePositionsRef.current,
+      requestedHoles,
       frame.width,
       frame.height,
     );
-    if (!calibration) {
-      setHandSetupError("Your hands moved out of view. Return to your normal grip and try again.");
+    if (!restingBindings) {
+      setHandSetupError(`Keep the ${requestedHand} hand visible in its normal playing position.`);
       return;
     }
-    const unclearFingers = calibration.bindings.filter(
-      (binding) => binding.restingDistance - binding.coveredDistance < 0.006,
-    );
+    const unclearFingers = restingBindings.filter((binding) => binding.restingDistance - binding.coveredDistance < 0.006);
     if (unclearFingers.length > 0) {
-      setHandSetupError(`Lift every playing finger a little farther — ${unclearFingers.length} ${unclearFingers.length === 1 ? "finger is" : "fingers are"} still too close to a hole.`);
+      setHandSetupError(`Lift the ${requestedHand} playing fingers a little farther from the holes.`);
+      return;
+    }
+    restingFingerMapRef.current = [...restingFingerMapRef.current, ...restingBindings];
+    if (requestedHand === "left") {
+      setHandSetupError("");
+      setHandSetupPhase("right-resting");
       return;
     }
 
+    const calibration: HandCalibration = {
+      bindings: restingFingerMapRef.current.sort((a, b) => a.holeId - b.holeId),
+      anchors: handAnchorsRef.current,
+      createdAt: Date.now(),
+    };
     window.localStorage.setItem(HAND_CALIBRATION_STORAGE_KEY, JSON.stringify(calibration));
     handCalibrationRef.current = calibration;
     setHandCalibration(calibration);
     coverageHistoryRef.current = [];
     coveredFingerMapRef.current = null;
+    restingFingerMapRef.current = [];
+    handAnchorsRef.current = [];
     setHandSetupError("");
     setHandSetupPhase("idle");
   };
+
+  const useTrackedLayout = cameraStatus === "live" && !calibrating && handSetupPhase === "idle" && Boolean(handCalibration);
+  const visibleHolePositions = useTrackedLayout ? trackedHolePositions : holePositions;
+  const visibleFluteGeometry = useTrackedLayout ? trackedFluteGeometry : fluteGeometry;
+  const handSetupCopy = handSetupPhase === "idle" ? null : {
+    "left-covered": {
+      step: 1,
+      title: "Cover holes 1–3 with your left hand",
+      detail: "Keep the left index, middle, and ring fingers down. Use your free right hand to capture.",
+      button: "Save left covered pose",
+    },
+    "right-covered": {
+      step: 2,
+      title: "Cover holes 4–6 with your right hand",
+      detail: "Keep the right index, middle, and ring fingers down. Use your free left hand to capture.",
+      button: "Save right covered pose",
+    },
+    "left-resting": {
+      step: 3,
+      title: "Raise your left playing fingers",
+      detail: "Hold the flute normally with the other hand and lift the three left fingers slightly above their holes.",
+      button: "Save left resting pose",
+    },
+    "right-resting": {
+      step: 4,
+      title: "Raise your right playing fingers",
+      detail: "Lift the three right fingers slightly. This completes your personal open-finger baseline.",
+      button: "Save right resting pose",
+    },
+  }[handSetupPhase];
 
   return (
     <main className="app-shell">
@@ -642,7 +795,7 @@ export default function Home() {
                 {cameraStatus === "live" ? "Live camera" : "Camera setup"}
               </div>
               <div className="camera-actions">
-                <span>{trackingStatus === "running" ? handCalibration ? "Finger map active" : "Mapping hands" : cameraStatus === "live" ? "Camera connected" : "Local video only"}</span>
+                <span>{trackingStatus === "running" ? handSetupPhase === "idle" && handCalibration ? "Flute + fingers tracked" : "Mapping hands" : cameraStatus === "live" ? "Camera connected" : "Local video only"}</span>
                 {cameraStatus === "live" && (
                   <button
                     className={debugMode ? "is-active" : ""}
@@ -674,11 +827,31 @@ export default function Home() {
 
               {cameraStatus === "live" ? (
                 <>
-                  <div className="alignment-guide" aria-hidden="true">
-                    <span className="alignment-line" />
-                    <span className="alignment-end left" />
-                    <span className="alignment-end right" />
+                  <div className={`flute-outline ${calibrating ? "is-editing" : ""}`} style={fluteStyle(visibleFluteGeometry)} aria-hidden="true">
+                    <span className="flute-centerline" />
                   </div>
+                  {calibrating && (["start", "end"] as FluteEndpoint[]).map((endpoint) => (
+                    <button
+                      className="flute-endpoint"
+                      key={endpoint}
+                      style={{
+                        left: `${(endpoint === "start" ? fluteGeometry.startX : fluteGeometry.endX) * 100}%`,
+                        top: `${(endpoint === "start" ? fluteGeometry.startY : fluteGeometry.endY) * 100}%`,
+                      }}
+                      aria-label={`Drag ${endpoint} of flute outline`}
+                      onPointerDown={(event) => {
+                        event.preventDefault();
+                        event.currentTarget.setPointerCapture(event.pointerId);
+                        setDraggingFluteEndpoint(endpoint);
+                      }}
+                      onPointerMove={updateFluteEndpoint}
+                      onPointerUp={(event) => {
+                        if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+                        setDraggingFluteEndpoint(null);
+                      }}
+                      onPointerCancel={() => setDraggingFluteEndpoint(null)}
+                    />
+                  ))}
                   <div className={`camera-hint ${calibrating || handSetupPhase !== "idle" ? "calibrating" : ""}`}>
                     {trackerHint}
                   </div>
@@ -687,9 +860,9 @@ export default function Home() {
                   <div className="frame-corner bottom-left" />
                   <div className="frame-corner bottom-right" />
 
-                  {(calibrating || hasCalibration) && holePositions.map((hole) => (
+                  {(calibrating || hasCalibration) && visibleHolePositions.map((hole) => (
                     <button
-                      className={`calibration-marker ${calibrating ? "is-editing" : "is-saved"} ${detectedHoles[hole.id - 1] ? "is-covered" : ""}`}
+                      className={`calibration-marker ${calibrating ? "is-editing" : "is-saved"} ${detectedHoles[hole.id - 1] ? "is-covered" : ""} ${handSetupPhase.startsWith("left") && hole.id <= 3 || handSetupPhase.startsWith("right") && hole.id >= 4 ? "is-hand-target" : ""}`}
                       key={hole.id}
                       style={{ left: `${hole.x * 100}%`, top: `${hole.y * 100}%` }}
                       aria-label={`Flute hole ${hole.id}${calibrating ? ", drag to reposition" : ""}`}
@@ -750,7 +923,7 @@ export default function Home() {
               </button>
               <button className="soft-button" onClick={beginCalibration} disabled={cameraStatus !== "live"}>
                 {hasCalibration ? <RotateCcw size={16} /> : <Crosshair size={16} />}
-                {hasCalibration ? "Recalibrate" : "Calibrate holes"}
+                {hasCalibration ? "Resize flute" : "Map flute"}
               </button>
               <button className="soft-button" onClick={beginHandCalibration} disabled={cameraStatus !== "live" || !hasCalibration}>
                 <Crosshair size={16} />
@@ -761,30 +934,41 @@ export default function Home() {
             {calibrating && (
               <div className="calibration-card" role="dialog" aria-label="Flute hole calibration">
                 <div>
-                  <span className="step-label">STEP 2 OF 3 · HOLE MAP</span>
-                  <strong>Place all six markers over the finger holes</strong>
-                  <p>Drag the numbered circles. Positions scale with the camera view.</p>
+                  <span className="step-label">STEP 2 OF 3 · FLUTE MAP</span>
+                  <strong>Fit the outline and place all six hole markers</strong>
+                  <p>Drag the two gold ends to set flute position, length, and angle. Then place the numbered holes.</p>
+                  <label className="flute-thickness-control">
+                    <span>Flute thickness</span>
+                    <input
+                      type="range"
+                      min="0.08"
+                      max="0.24"
+                      step="0.01"
+                      value={fluteGeometry.thickness}
+                      onChange={(event) => {
+                        const nextGeometry = { ...fluteGeometry, thickness: Number(event.target.value) };
+                        fluteGeometryRef.current = nextGeometry;
+                        setFluteGeometry(nextGeometry);
+                        setTrackedFluteGeometry(nextGeometry);
+                      }}
+                    />
+                  </label>
                 </div>
                 <div className="calibration-actions">
                   {hasCalibration && <button className="cancel-button" onClick={cancelCalibration}>Cancel</button>}
-                  <button onClick={confirmCalibration}><Save size={15} /> Save calibration</button>
+                  <button onClick={confirmCalibration}><Save size={15} /> Save flute & holes</button>
                 </div>
               </div>
             )}
 
-            {!calibrating && handSetupPhase !== "idle" && (
+            {!calibrating && handSetupCopy && (
               <div className="calibration-card hand-map-card" role="dialog" aria-label="Personal finger mapping">
                 <div>
                   <span className="step-label">STEP 3 OF 3 · PERSONAL HAND MAP</span>
-                  <strong>{handSetupPhase === "covered" ? "Cover all six holes" : "Lift the six playing fingers slightly"}</strong>
-                  <p>
-                    {handSetupPhase === "covered"
-                      ? "Use both index, middle, and ring fingers. Keep thumbs and pinkies in their normal support positions."
-                      : "Keep holding the flute normally. This raised position becomes your personal open-finger baseline."}
-                  </p>
-                  <div className="pose-progress" aria-label={`Hand mapping step ${handSetupPhase === "covered" ? 1 : 2} of 2`}>
-                    <span className="is-complete" />
-                    <span className={handSetupPhase === "resting" ? "is-complete" : ""} />
+                  <strong>{handSetupCopy.title}</strong>
+                  <p>{handSetupCopy.detail}</p>
+                  <div className="pose-progress" aria-label={`Hand mapping step ${handSetupCopy.step} of 4`}>
+                    {[1, 2, 3, 4].map((step) => <span className={step <= handSetupCopy.step ? "is-complete" : ""} key={step} />)}
                   </div>
                   {handSetupError && <p className="calibration-error">{handSetupError}</p>}
                 </div>
@@ -793,14 +977,17 @@ export default function Home() {
                     className="cancel-button"
                     onClick={() => {
                       coveredFingerMapRef.current = null;
+                      restingFingerMapRef.current = [];
+                      handAnchorsRef.current = [];
+                      handCalibrationRef.current = handCalibration;
                       setHandSetupError("");
                       setHandSetupPhase("idle");
                     }}
                   >
                     Cancel
                   </button>
-                  <button onClick={handSetupPhase === "covered" ? captureCoveredPose : captureRestingPose}>
-                    <Crosshair size={15} /> {handSetupPhase === "covered" ? "Capture covered pose" : "Capture resting pose"}
+                  <button onClick={captureHandPose}>
+                    <Crosshair size={15} /> {handSetupCopy.button}
                   </button>
                 </div>
               </div>

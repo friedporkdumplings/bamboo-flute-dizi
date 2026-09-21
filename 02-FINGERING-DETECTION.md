@@ -99,6 +99,8 @@ Example:
 
 This prevents coordinate problems if the video size changes.
 
+Also store an adjustable flute outline with two endpoints and a thickness value. During personal hand setup, capture each hand separately so the free hand can operate the interface. Save stable palm anchors for both hands and use their live translation, rotation, and scale to move the flute outline and hole coordinates during practice.
+
 ## Step 3 — MediaPipe Hands
 
 Use MediaPipe Hand Landmarker.

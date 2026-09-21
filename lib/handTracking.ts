@@ -34,12 +34,19 @@ export type CoveredFingerBinding = FingerSegment & {
   coveredDistance: number;
 };
 
+export type HandAnchor = {
+  handLabel: string;
+  x: number;
+  y: number;
+};
+
 export type FingerBinding = CoveredFingerBinding & {
   restingDistance: number;
 };
 
 export type HandCalibration = {
   bindings: FingerBinding[];
+  anchors: HandAnchor[];
   createdAt: number;
 };
 
@@ -112,21 +119,25 @@ function normalizedSegmentDistance(
   ) / scale;
 }
 
-export function buildCoveredFingerMap(
+export function buildCoveredFingerMapForHand(
   hands: NormalizedLandmark[][],
   handLabels: string[],
+  requestedHand: "left" | "right",
   holes: CalibratedHole[],
   width: number,
   height: number,
 ): CoveredFingerBinding[] | null {
-  const candidates = hands.flatMap((landmarks, handIndex) => FINGER_PAD_SEGMENTS.map((segment) => ({
-    ...segment,
-    handLabel: handLabels[handIndex] ?? `hand-${handIndex}`,
-    landmarks,
-    key: `${handLabels[handIndex] ?? `hand-${handIndex}`}-${segment.finger}`,
-  })));
+  let requestedIndex = handLabels.findIndex((label) => label.toLowerCase() === requestedHand);
+  if (requestedIndex === -1 && hands.length === 1) requestedIndex = 0;
+  const requestedLandmarks = hands[requestedIndex];
+  if (!requestedLandmarks || holes.length !== 3) return null;
 
-  if (candidates.length < 6) return null;
+  const candidates = FINGER_PAD_SEGMENTS.map((segment) => ({
+    ...segment,
+    handLabel: handLabels[requestedIndex] ?? requestedHand,
+    landmarks: requestedLandmarks,
+    key: `${handLabels[requestedIndex] ?? requestedHand}-${segment.finger}`,
+  }));
 
   const pairs = holes.flatMap((hole) => candidates.map((candidate) => ({
     hole,
@@ -164,16 +175,17 @@ export function buildCoveredFingerMap(
   return bindings.sort((a, b) => a.holeId - b.holeId);
 }
 
-export function addRestingFingerPose(
+export function addRestingFingerPoseForHand(
   coveredBindings: CoveredFingerBinding[],
   hands: NormalizedLandmark[][],
   handLabels: string[],
   holes: CalibratedHole[],
   width: number,
   height: number,
-): HandCalibration | null {
+): FingerBinding[] | null {
   const bindings = coveredBindings.map((binding) => {
-    const handIndex = handLabels.indexOf(binding.handLabel);
+    let handIndex = handLabels.indexOf(binding.handLabel);
+    if (handIndex === -1 && hands.length === 1) handIndex = 0;
     const landmarks = hands[handIndex];
     const hole = holes.find((item) => item.id === binding.holeId);
     if (!landmarks || !hole) return null;
@@ -191,7 +203,7 @@ export function addRestingFingerPose(
   });
 
   if (bindings.some((binding) => !binding)) return null;
-  return { bindings: bindings as FingerBinding[], createdAt: Date.now() };
+  return bindings as FingerBinding[];
 }
 
 export function detectMappedCoverage(
@@ -201,11 +213,13 @@ export function detectMappedCoverage(
   calibration: HandCalibration,
   width: number,
   height: number,
+  distanceScale = 1,
 ) {
   return holes.map((hole) => {
     const binding = calibration.bindings.find((item) => item.holeId === hole.id);
     if (!binding) return false;
-    const handIndex = handLabels.indexOf(binding.handLabel);
+    let handIndex = handLabels.indexOf(binding.handLabel);
+    if (handIndex === -1 && hands.length === 1) handIndex = 0;
     const landmarks = hands[handIndex];
     if (!landmarks) return false;
 
@@ -217,8 +231,10 @@ export function detectMappedCoverage(
       width,
       height,
     );
-    const separation = Math.max(binding.restingDistance - binding.coveredDistance, 0.012);
-    const coveredThreshold = binding.coveredDistance + separation * 0.42;
+    const coveredDistance = binding.coveredDistance * distanceScale;
+    const restingDistance = binding.restingDistance * distanceScale;
+    const separation = Math.max(restingDistance - coveredDistance, 0.012 * distanceScale);
+    const coveredThreshold = coveredDistance + separation * 0.42;
     return currentDistance <= coveredThreshold;
   });
 }
