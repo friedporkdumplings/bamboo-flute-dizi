@@ -44,8 +44,7 @@ function currentAnchor(
   handLabels: string[],
   reference: HandAnchor,
 ) {
-  let index = handLabels.indexOf(reference.handLabel);
-  if (index === -1 && hands.length === 1) index = 0;
+  const index = handLabels.indexOf(reference.handLabel);
   const center = index >= 0 ? palmCenter(hands[index]) : null;
   return center ? { ...reference, ...center } : null;
 }
@@ -56,40 +55,40 @@ export function trackFluteLayout(
   referenceAnchors: HandAnchor[],
   hands: NormalizedLandmark[][],
   handLabels: string[],
-): TrackedFluteLayout {
+): TrackedFluteLayout | null {
   const references = referenceAnchors
     .map((reference) => ({ reference, current: currentAnchor(hands, handLabels, reference) }))
     .filter((pair): pair is { reference: HandAnchor; current: HandAnchor } => Boolean(pair.current));
 
-  if (references.length === 0) return { holes, geometry, scale: 1 };
+  if (references.length < 2) return null;
 
   let scale = 1;
   let rotation = 0;
-  let referenceCenter = references[0].reference;
-  let currentCenter = references[0].current;
-
-  if (references.length >= 2) {
-    const first = references[0];
-    const second = references[1];
-    const referenceDx = second.reference.x - first.reference.x;
-    const referenceDy = second.reference.y - first.reference.y;
-    const currentDx = second.current.x - first.current.x;
-    const currentDy = second.current.y - first.current.y;
-    const referenceDistance = Math.hypot(referenceDx, referenceDy);
-    const currentDistance = Math.hypot(currentDx, currentDy);
-    scale = referenceDistance > 0.001 ? Math.min(1.55, Math.max(0.65, currentDistance / referenceDistance)) : 1;
-    rotation = Math.atan2(currentDy, currentDx) - Math.atan2(referenceDy, referenceDx);
-    referenceCenter = {
-      handLabel: "center",
-      x: (first.reference.x + second.reference.x) / 2,
-      y: (first.reference.y + second.reference.y) / 2,
-    };
-    currentCenter = {
-      handLabel: "center",
-      x: (first.current.x + second.current.x) / 2,
-      y: (first.current.y + second.current.y) / 2,
-    };
-  }
+  const first = references[0];
+  const second = references[1];
+  const referenceDx = second.reference.x - first.reference.x;
+  const referenceDy = second.reference.y - first.reference.y;
+  const currentDx = second.current.x - first.current.x;
+  const currentDy = second.current.y - first.current.y;
+  const referenceDistance = Math.hypot(referenceDx, referenceDy);
+  const currentDistance = Math.hypot(currentDx, currentDy);
+  if (referenceDistance <= 0.001 || currentDistance <= 0.001) return null;
+  const rawScale = currentDistance / referenceDistance;
+  if (rawScale < 0.55 || rawScale > 1.75) return null;
+  scale = Math.min(1.55, Math.max(0.65, rawScale));
+  const rawRotation = Math.atan2(currentDy, currentDx) - Math.atan2(referenceDy, referenceDx);
+  rotation = Math.atan2(Math.sin(rawRotation), Math.cos(rawRotation));
+  if (Math.abs(rotation) > Math.PI / 3) return null;
+  const referenceCenter = {
+    handLabel: "center",
+    x: (first.reference.x + second.reference.x) / 2,
+    y: (first.reference.y + second.reference.y) / 2,
+  };
+  const currentCenter = {
+    handLabel: "center",
+    x: (first.current.x + second.current.x) / 2,
+    y: (first.current.y + second.current.y) / 2,
+  };
 
   const cosine = Math.cos(rotation);
   const sine = Math.sin(rotation);

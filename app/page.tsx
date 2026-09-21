@@ -293,6 +293,7 @@ export default function Home() {
   const holePositionsRef = useRef<HolePosition[]>(DEFAULT_HOLE_POSITIONS);
   const fluteGeometryRef = useRef<FluteGeometry>(DEFAULT_FLUTE_GEOMETRY);
   const trackedHolePositionsRef = useRef<HolePosition[]>(DEFAULT_HOLE_POSITIONS);
+  const trackedScaleRef = useRef(1);
   const lastLayoutUpdateRef = useRef(0);
   const debugModeRef = useRef(true);
   const handCalibrationRef = useRef<HandCalibration | null>(null);
@@ -495,9 +496,12 @@ export default function Home() {
                     handLabels,
                   )
                 : null;
-              const activeHoles = trackedLayout?.holes ?? holePositionsRef.current;
+              const activeHoles = calibration
+                ? trackedLayout?.holes ?? trackedHolePositionsRef.current
+                : holePositionsRef.current;
               if (trackedLayout) {
                 trackedHolePositionsRef.current = trackedLayout.holes;
+                trackedScaleRef.current = trackedLayout.scale;
                 if (performance.now() - lastLayoutUpdateRef.current > 80) {
                   lastLayoutUpdateRef.current = performance.now();
                   setTrackedHolePositions(trackedLayout.holes);
@@ -512,7 +516,7 @@ export default function Home() {
                     calibration,
                     liveCanvas.clientWidth,
                     liveCanvas.clientHeight,
-                    trackedLayout?.scale ?? 1,
+                    trackedLayout?.scale ?? trackedScaleRef.current,
                   )
                 : detectHoleCoverage(
                     result.landmarks,
